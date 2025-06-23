@@ -8,7 +8,6 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Newtonsoft.Json;
-using System.Text.Json;
 
 // Assembly attribute to enable the Lambda function's JSON input to be converted into a .NET class.
 [assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
@@ -149,45 +148,13 @@ public class Function
         {
             options.CartFilesPath = Environment.GetEnvironmentVariable("CART_FILES_PATH") ?? "/tmp/cart/{printRequestId}/{productVariantId}/{productVariantViewId}";
             options.FontsPath = Environment.GetEnvironmentVariable("FONTS_PATH") ?? "/app/Fonts/";
-            options.Aws.Region = Environment.GetEnvironmentVariable("AWS_REGION") ?? "us-east-1";
+            options.Aws.Region = Environment.GetEnvironmentVariable("AWS_REGION") ?? "eu-west-2";
             options.Aws.S3BucketName = Environment.GetEnvironmentVariable("S3_BUCKET_NAME") ?? "";
             options.Aws.SqsQueueUrl = Environment.GetEnvironmentVariable("SQS_QUEUE_URL") ?? "";
         });
 
         // Register services
         services.AddScoped<IPrintReadyService, PrintReadyService>();
-
-        // Configure IronPDF for Lambda environment
-        ConfigureIronPdf();
-    }
-
-    private void ConfigureIronPdf()
-    {
-        try
-        {
-            // Configure IronPDF for Lambda/Linux environment
-            if (Environment.OSVersion.Platform == PlatformID.Unix)
-            {
-                IronPdf.Installation.ChromeGpuMode = IronPdf.Engines.Chrome.ChromeGpuModes.Disabled;
-                IronPdf.Installation.DefaultRenderingEngine = IronPdf.Rendering.ChromePdfRenderingEngine.Chrome;
-            }
-
-            // Set license key if available
-            var licenseKey = Environment.GetEnvironmentVariable("IRONPDF_LICENSE_KEY");
-            if (!string.IsNullOrEmpty(licenseKey))
-            {
-                IronPdf.License.LicenseKey = licenseKey;
-                _logger?.LogInformation("IronPDF license configured");
-            }
-            else
-            {
-                _logger?.LogWarning("IronPDF license not configured - PDFs will have watermarks");
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogError(ex, "Failed to configure IronPDF");
-        }
     }
 
     // Example methods for saving results (implement as needed)

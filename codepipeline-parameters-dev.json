@@ -1,0 +1,26 @@
+[
+  {
+    "ParameterKey": "GitHubOwner",
+    "ParameterValue": "your-github-username-or-org"
+  },
+  {
+    "ParameterKey": "GitHubRepo",
+    "ParameterValue": "hive-service-print"
+  },
+  {
+    "ParameterKey": "GitHubBranch",
+    "ParameterValue": "develop"
+  },
+  {
+    "ParameterKey": "GitHubToken",
+    "ParameterValue": "your-github-personal-access-token"
+  },
+  {
+    "ParameterKey": "ECRRepositoryName",
+    "ParameterValue": "hive-service-print"
+  },
+  {
+    "ParameterKey": "Environment",
+    "ParameterValue": "dev"
+  }
+]

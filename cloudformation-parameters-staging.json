@@ -1,0 +1,38 @@
+[
+  {
+    "ParameterKey": "Environment",
+    "ParameterValue": "staging"
+  },
+  {
+    "ParameterKey": "ECRImageURI",
+    "ParameterValue": "891377085221.dkr.ecr.eu-west-2.amazonaws.com/hive-service-print:latest"
+  },
+  {
+    "ParameterKey": "ExistingSQSQueueUrl",
+    "ParameterValue": "https://sqs.eu-west-2.amazonaws.com/891377085221/hive-print-order-queue-staging"
+  },
+  {
+    "ParameterKey": "ExistingSQSQueueArn",
+    "ParameterValue": "arn:aws:sqs:eu-west-2:891377085221:hive-print-order-queue-staging"
+  },
+  {
+    "ParameterKey": "ExistingS3BucketName",
+    "ParameterValue": "hive-designer-staging"
+  },
+  {
+    "ParameterKey": "VpcId",
+    "ParameterValue": ""
+  },
+  {
+    "ParameterKey": "SubnetIds",
+    "ParameterValue": ""
+  },
+  {
+    "ParameterKey": "LambdaTimeout",
+    "ParameterValue": "600"
+  },
+  {
+    "ParameterKey": "LambdaMemorySize",
+    "ParameterValue": "1536"
+  }
+]

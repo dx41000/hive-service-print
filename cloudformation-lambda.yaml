@@ -1,0 +1,293 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Hive Service Print Lambda Function with SQS, S3, and supporting resources'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name'
+  
+  ECRImageURI:
+    Type: String
+    Description: 'ECR Image URI for the Lambda function (e.g., 123456789012.dkr.ecr.eu-west-2.amazonaws.com/hive-service-print:latest)'
+  
+  ExistingSQSQueueUrl:
+    Type: String
+    Description: 'URL of the existing SQS queue for print orders'
+    Default: 'https://sqs.eu-west-2.amazonaws.com/891377085221/hive-print-order-queue-production'
+  
+  ExistingSQSQueueArn:
+    Type: String
+    Description: 'ARN of the existing SQS queue for print orders'
+    Default: 'arn:aws:sqs:eu-west-2:891377085221:hive-print-order-queue-production'
+  
+  ExistingS3BucketName:
+    Type: String
+    Description: 'Name of the existing S3 bucket for storing print files'
+    Default: 'hive-designer-production'
+  
+  VpcId:
+    Type: String
+    Description: 'VPC ID where Lambda will be deployed (optional)'
+    Default: ''
+  
+  SubnetIds:
+    Type: CommaDelimitedList
+    Description: 'Subnet IDs for Lambda (optional, required if VpcId is provided)'
+    Default: ''
+  
+  LambdaTimeout:
+    Type: Number
+    Default: 900
+    Description: 'Lambda function timeout in seconds (max 15 minutes)'
+  
+  LambdaMemorySize:
+    Type: Number
+    Default: 1024
+    MinValue: 512
+    MaxValue: 10240
+    Description: 'Lambda function memory size in MB'
+
+Conditions:
+  HasVPC: !Not [!Equals [!Ref VpcId, '']]
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # SQS Queue for results (optional)
+  PrintResultQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'hive-print-results-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: hive-print
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'hive-print-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !If 
+          - HasVPC
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+          - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sqs:ReceiveMessage'
+                  - 'sqs:DeleteMessage'
+                  - 'sqs:GetQueueAttributes'
+                  - 'sqs:ChangeMessageVisibility'
+                Resource: !Ref ExistingSQSQueueArn
+              - Effect: Allow
+                Action:
+                  - 'sqs:SendMessage'
+                Resource: !GetAtt PrintResultQueue.Arn
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                Resource: !Sub 'arn:aws:s3:::${ExistingS3BucketName}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                Resource: !Sub 'arn:aws:s3:::${ExistingS3BucketName}'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+  # Lambda Function
+  PrintReadyLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'hive-print-service-${Environment}'
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ECRImageURI
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          AWS_REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+          S3_BUCKET_NAME: !Ref ExistingS3BucketName
+          SQS_QUEUE_URL: !Ref ExistingSQSQueueUrl
+          RESULT_QUEUE_URL: !Ref PrintResultQueue
+          CART_FILES_PATH: '/tmp/cart/{printRequestId}/{productVariantId}/{productVariantViewId}'
+          FONTS_PATH: '/app/Fonts/'
+          DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: '1'
+      VpcConfig: !If
+        - HasVPC
+        - SecurityGroupIds:
+            - !Ref LambdaSecurityGroup
+          SubnetIds: !Ref SubnetIds
+        - !Ref AWS::NoValue
+      ReservedConcurrencyLimit: !If [IsProduction, 100, 10]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: hive-print
+
+  # Lambda Security Group (if VPC is used)
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: HasVPC
+    Properties:
+      GroupDescription: Security group for Hive Print Lambda
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub 'hive-print-lambda-sg-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SQS Event Source Mapping
+  SQSEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !Ref ExistingSQSQueueArn
+      FunctionName: !Ref PrintReadyLambda
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  # CloudWatch Log Groups
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/hive-print-service-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  # CloudWatch Alarms
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'hive-print-lambda-errors-${Environment}'
+      AlarmDescription: 'Lambda function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PrintReadyLambda
+      TreatMissingData: notBreaching
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'hive-print-lambda-duration-${Environment}'
+      AlarmDescription: 'Lambda function duration'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 600000  # 10 minutes in milliseconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PrintReadyLambda
+      TreatMissingData: notBreaching
+
+  # SNS Topic for Alerts (optional)
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'hive-print-alerts-${Environment}'
+      DisplayName: 'Hive Print Service Alerts'
+
+  # Lambda Version and Alias for Blue/Green deployments
+  LambdaVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref PrintReadyLambda
+      Description: !Sub 'Version deployed at ${AWS::StackName}'
+
+  LambdaAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref PrintReadyLambda
+      FunctionVersion: !GetAtt LambdaVersion.Version
+      Name: !Ref Environment
+
+Outputs:
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt PrintReadyLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaArn'
+
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function'
+    Value: !Ref PrintReadyLambda
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaName'
+
+  ExistingSQSQueueURL:
+    Description: 'URL of the existing SQS queue for print requests'
+    Value: !Ref ExistingSQSQueueUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-SQSQueueURL'
+
+  ExistingSQSQueueArn:
+    Description: 'ARN of the existing SQS queue for print requests'
+    Value: !Ref ExistingSQSQueueArn
+    Export:
+      Name: !Sub '${AWS::StackName}-SQSQueueArn'
+
+  ResultQueueURL:
+    Description: 'URL of the result queue'
+    Value: !Ref PrintResultQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-ResultQueueURL'
+
+  ExistingS3BucketName:
+    Description: 'Name of the existing S3 bucket for print files'
+    Value: !Ref ExistingS3BucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+
+  ExistingS3BucketArn:
+    Description: 'ARN of the existing S3 bucket for print files'
+    Value: !Sub 'arn:aws:s3:::${ExistingS3BucketName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketArn'

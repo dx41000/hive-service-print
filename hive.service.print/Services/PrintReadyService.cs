@@ -2,11 +2,16 @@ using hive.service.print.Configuration;
 using hive.service.print.Models;
 using hive.service.print.Models.PrintReady;
 using ImageMagick;
-using IronPdf;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Newtonsoft.Json;
+using PdfSharpCore.Drawing;
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.Processing;
+using SixLabors.ImageSharp.Formats.Png;
+using SixLabors.ImageSharp.PixelFormats;
 using SkiaSharp;
+using PdfDocument = PdfSharpCore.Pdf.PdfDocument;
 
 namespace hive.service.print.Services;
 
@@ -77,7 +82,7 @@ public class PrintReadyService : IPrintReadyService
 
                 // Create the final image with proper disposal
                 using var overlayedImage = OverlayImage(baseArtWorkStream, artWorks);
-                using var pdfStream = CreatePdf(overlayedImage);
+                using var pdfStream = CreatePdf(overlayedImage, mockProductVariant.BaseArtworkWidth, mockProductVariant.BaseArtworkHeight);
                 
                 var printFile = StreamToByteArray(pdfStream);
 
@@ -172,129 +177,51 @@ public class PrintReadyService : IPrintReadyService
         return resultStream;
     }
 
-    public Stream CreatePdf(Stream pngFile)
+    public Stream CreatePdf(Stream pngInput, double targetWidth, double targetHeight)
     {
+        const float defaultDpi = 300f;
+        var pdfStream = new MemoryStream();
+
         try
         {
-            // Reset stream position
-            pngFile.Position = 0;
-            
-            // Convert stream to byte array efficiently
-            byte[] imageBytes;
-            if (pngFile is MemoryStream ms)
-            {
-                imageBytes = ms.ToArray();
-            }
-            else
-            {
-                using var tempMs = new MemoryStream();
-                pngFile.CopyTo(tempMs);
-                imageBytes = tempMs.ToArray();
-            }
+            pngInput.Position = 0;
+            using var image = Image.Load<Rgba32>(pngInput);
 
-            // Get image dimensions using SkiaSharp for size validation
-            using var bitmap = SKBitmap.Decode(imageBytes);
-            if (bitmap == null)
-            {
-                throw new InvalidOperationException("Failed to decode PNG image for PDF creation");
-            }
+            // Step 1: Flatten transparency (important!)
+            image.Mutate(x => x.BackgroundColor(SixLabors.ImageSharp.Color.White));
 
-            var originalWidth = bitmap.Width;
-            var originalHeight = bitmap.Height;
-
-            // Apply size constraints (same logic as original)
-            const float maxSize = 14400f;
-            var scaleFactor = 1.0f;
-            
-            if (originalWidth > maxSize || originalHeight > maxSize)
+            // Step 2: Save as clean PNG (no alpha, reduced memory use)
+            var cleanedPng = new MemoryStream();
+            image.SaveAsPng(cleanedPng, new PngEncoder
             {
-                var widthRatio = maxSize / originalWidth;
-                var heightRatio = maxSize / originalHeight;
-                scaleFactor = Math.Min(widthRatio, heightRatio);
+                ColorType = PngColorType.Rgb, // removes alpha
+                CompressionLevel = PngCompressionLevel.Level6
+            });
+            cleanedPng.Position = 0;
+
+            // Step 3: Load into PdfSharpCore
+            using var xImage = XImage.FromStream(() => cleanedPng);
+
+            double pageWidth = targetWidth / 2.54 * 72;   // Convert cm to points
+            double pageHeight = targetHeight / 2.54 * 72;  // Convert cm to points
+
+            var doc = new PdfDocument();
+            var page = doc.AddPage();
+            page.Width = pageWidth;
+            page.Height = pageHeight;
+
+            using (var gfx = XGraphics.FromPdfPage(page))
+            {
+                gfx.DrawImage(xImage, 0, 0, pageWidth, pageHeight);
             }
 
-            // Resize image if needed using SkiaSharp
-            byte[] finalImageBytes = imageBytes;
-            if (scaleFactor < 1.0f)
-            {
-                var newWidth = (int)(originalWidth * scaleFactor);
-                var newHeight = (int)(originalHeight * scaleFactor);
-                
-                using var resizedBitmap = bitmap.Resize(new SKImageInfo(newWidth, newHeight), SKFilterQuality.High);
-                if (resizedBitmap == null)
-                {
-                    throw new InvalidOperationException("Failed to resize image for PDF creation");
-                }
-                
-                using var resizedImage = SKImage.FromBitmap(resizedBitmap);
-                using var data = resizedImage.Encode(SKEncodedImageFormat.Png, 100);
-                finalImageBytes = data.ToArray();
-            }
-
-            // Create PDF using IronPDF Linux - using HTML approach for better Linux compatibility
-            var base64Image = Convert.ToBase64String(finalImageBytes);
-            
-            // Create HTML with embedded image for precise control
-            var html = $@"
-<!DOCTYPE html>
-<html>
-<head>
-    <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        html, body {{ width: 100%; height: 100%; }}
-        .image-container {{ 
-            width: 100%; 
-            height: 100vh; 
-            display: flex; 
-            justify-content: center; 
-            align-items: center; 
-        }}
-        img {{ 
-            max-width: 100%; 
-            max-height: 100%; 
-            object-fit: contain; 
-        }}
-    </style>
-</head>
-<body>
-    <div class='image-container'>
-        <img src='data:image/png;base64,{base64Image}' alt='Print Ready Image' />
-    </div>
-</body>
-</html>";
-
-            // Configure Chrome PDF renderer for Linux
-            var renderer = new ChromePdfRenderer();
-            
-            // Configure rendering options for print quality
-            renderer.RenderingOptions.PaperSize = PdfPaperSize.Custom;
-            renderer.RenderingOptions.PaperOrientation = PdfPaperOrientation.Portrait;
-            renderer.RenderingOptions.MarginTop = 0;
-            renderer.RenderingOptions.MarginBottom = 0;
-            renderer.RenderingOptions.MarginLeft = 0;
-            renderer.RenderingOptions.MarginRight = 0;
-            renderer.RenderingOptions.EnableJavaScript = false;
-            renderer.RenderingOptions.Timeout = 60; // 60 second timeout
-            renderer.RenderingOptions.CreatePdfFormsFromHtml = false;
-            
-            // Set custom paper size based on image dimensions
-            var dpi = 300; // Standard print DPI
-            var widthInches = (float)originalWidth / dpi;
-            var heightInches = (float)originalHeight / dpi;
-            renderer.RenderingOptions.SetCustomPaperSizeInInches(widthInches, heightInches);
-
-            // Render HTML to PDF
-            using var pdfDocument = renderer.RenderHtmlAsPdf(html);
-            
-            // Return the PDF as a stream
-            var resultStream = new MemoryStream(pdfDocument.BinaryData);
-            resultStream.Position = 0;
-            
-            return resultStream;
+            doc.Save(pdfStream, false);
+            pdfStream.Position = 0;
+            return pdfStream;
         }
-        catch (Exception ex)
+        catch
         {
-            _logger.LogError(ex, "Error creating PDF from PNG stream using IronPDF Linux");
+            pdfStream?.Dispose();
             throw;
         }
     }
@@ -323,7 +250,6 @@ public class PrintReadyService : IPrintReadyService
         try
         {
             // Create a simple thumbnail from the PDF
-            // In real implementation, you'd use ImageMagick or similar
             using var image = new MagickImage(pdfBytes);
             image.Resize(400, 0); // Resize to 400px width, maintain aspect ratio
             image.Format = MagickFormat.Png;
@@ -339,13 +265,15 @@ public class PrintReadyService : IPrintReadyService
     // Mock methods for Lambda version - replace with real data access in production
     private MockProductVariant CreateMockProductVariant(long productVariantId)
     {
-        // Create a simple 100x100 white PNG as base artwork
+        // Create a simple 800x600 white PNG as base artwork
         var baseArtwork = CreateMockImageBytes(800, 600, SKColors.White);
         
         return new MockProductVariant
         {
             Id = productVariantId,
             BaseArtwork = baseArtwork,
+            BaseArtworkWidth = 14.0, // 14cm
+            BaseArtworkHeight = 21.0, // 21cm (A5 size)
             PrintFile = null,
             BaseArtworkThumb = null
         };
@@ -391,6 +319,8 @@ public class PrintReadyService : IPrintReadyService
     {
         public long Id { get; set; }
         public byte[] BaseArtwork { get; set; } = Array.Empty<byte>();
+        public double BaseArtworkWidth { get; set; }
+        public double BaseArtworkHeight { get; set; }
         public byte[]? PrintFile { get; set; }
         public byte[]? BaseArtworkThumb { get; set; }
     }

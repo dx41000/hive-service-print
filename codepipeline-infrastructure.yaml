@@ -1,0 +1,468 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CodePipeline infrastructure for Hive Service Print Lambda deployment'
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Description: 'GitHub repository owner/organization'
+    Default: 'your-github-org'
+  
+  GitHubRepo:
+    Type: String
+    Description: 'GitHub repository name'
+    Default: 'hive-service-print'
+  
+  GitHubBranch:
+    Type: String
+    Description: 'GitHub branch to track'
+    Default: 'main'
+  
+  GitHubToken:
+    Type: String
+    Description: 'GitHub personal access token (stored in Secrets Manager)'
+    NoEcho: true
+  
+  ECRRepositoryName:
+    Type: String
+    Description: 'ECR repository name for Docker images'
+    Default: 'hive-service-print'
+  
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Target environment for deployment'
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # S3 Bucket for CodePipeline artifacts
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'hive-codepipeline-artifacts-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 7
+
+  # ECR Repository for Docker images
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref ECRRepositoryName
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Delete untagged images older than 1 day",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 1
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+
+  # CodeBuild Service Role
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'hive-codebuild-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                Resource: !Sub '${ArtifactsBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:BatchGetImage'
+                  - 'ecr:GetAuthorizationToken'
+                  - 'ecr:PutImage'
+                  - 'ecr:InitiateLayerUpload'
+                  - 'ecr:UploadLayerPart'
+                  - 'ecr:CompleteLayerUpload'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'cloudformation:ValidateTemplate'
+                  - 'cloudformation:DescribeStacks'
+                  - 'cloudformation:DescribeStackEvents'
+                  - 'cloudformation:CreateStack'
+                  - 'cloudformation:UpdateStack'
+                  - 'cloudformation:DeleteStack'
+                  - 'cloudformation:DescribeStackResources'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'iam:CreateRole'
+                  - 'iam:DeleteRole'
+                  - 'iam:GetRole'
+                  - 'iam:PassRole'
+                  - 'iam:AttachRolePolicy'
+                  - 'iam:DetachRolePolicy'
+                  - 'iam:PutRolePolicy'
+                  - 'iam:DeleteRolePolicy'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'lambda:*'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'sqs:*'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 's3:*'
+                Resource: '*'
+
+  # CodeBuild Project for Build Stage
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub 'hive-service-print-build-${Environment}'
+      Description: 'Build Docker image for Hive Service Print Lambda'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: IMAGE_REPO_NAME
+            Value: !Ref ECRRepositoryName
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Logging in to Amazon ECR...
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+                - IMAGE_TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:0:8}
+                - IMAGE_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                - IMAGE_URI_LATEST=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:latest
+            build:
+              commands:
+                - echo Build started on `date`
+                - echo Building the Docker image...
+                - cd hive.service.print
+                - docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG .
+                - docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $IMAGE_URI
+                - docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $IMAGE_URI_LATEST
+            post_build:
+              commands:
+                - echo Build completed on `date`
+                - echo Pushing the Docker images...
+                - docker push $IMAGE_URI
+                - docker push $IMAGE_URI_LATEST
+                - echo Writing image definitions file...
+                - printf '[{"name":"hive-service-print","imageUri":"%s"}]' $IMAGE_URI > imagedefinitions.json
+                - echo Updating CloudFormation parameters...
+                - cd ..
+                - |
+                  jq --arg uri "$IMAGE_URI" '(.[] | select(.ParameterKey == "ECRImageURI") | .ParameterValue) = $uri' \
+                    cloudformation-parameters-${ENVIRONMENT}.json > cloudformation-parameters-${ENVIRONMENT}.json.tmp && \
+                    mv cloudformation-parameters-${ENVIRONMENT}.json.tmp cloudformation-parameters-${ENVIRONMENT}.json
+          artifacts:
+            files:
+              - '**/*'
+
+  # CodeBuild Project for Deploy Stage
+  CodeBuildDeploy:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub 'hive-service-print-deploy-${Environment}'
+      Description: 'Deploy Hive Service Print Lambda using CloudFormation'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+          - Name: STACK_NAME
+            Value: !Sub 'hive-print-${Environment}'
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Starting deployment preparation...
+                - echo Environment is $ENVIRONMENT
+                - echo Stack name is $STACK_NAME
+            build:
+              commands:
+                - echo Validating CloudFormation template...
+                - aws cloudformation validate-template --template-body file://cloudformation-lambda.yaml
+                - echo Deploying CloudFormation stack...
+                - |
+                  if aws cloudformation describe-stacks --stack-name $STACK_NAME --region $AWS_DEFAULT_REGION >/dev/null 2>&1; then
+                    echo "Updating existing stack..."
+                    aws cloudformation update-stack \
+                      --stack-name $STACK_NAME \
+                      --template-body file://cloudformation-lambda.yaml \
+                      --parameters file://cloudformation-parameters-${ENVIRONMENT}.json \
+                      --capabilities CAPABILITY_NAMED_IAM \
+                      --region $AWS_DEFAULT_REGION
+                    echo "Waiting for stack update to complete..."
+                    aws cloudformation wait stack-update-complete \
+                      --stack-name $STACK_NAME \
+                      --region $AWS_DEFAULT_REGION
+                  else
+                    echo "Creating new stack..."
+                    aws cloudformation create-stack \
+                      --stack-name $STACK_NAME \
+                      --template-body file://cloudformation-lambda.yaml \
+                      --parameters file://cloudformation-parameters-${ENVIRONMENT}.json \
+                      --capabilities CAPABILITY_NAMED_IAM \
+                      --region $AWS_DEFAULT_REGION
+                    echo "Waiting for stack creation to complete..."
+                    aws cloudformation wait stack-create-complete \
+                      --stack-name $STACK_NAME \
+                      --region $AWS_DEFAULT_REGION
+                  fi
+            post_build:
+              commands:
+                - echo Deployment completed successfully!
+                - echo Getting stack outputs...
+                - aws cloudformation describe-stacks --stack-name $STACK_NAME --region $AWS_DEFAULT_REGION --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' --output table
+
+  # CodePipeline Service Role
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'hive-codepipeline-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:GetBucketVersioning'
+                Resource:
+                  - !Sub '${ArtifactsBucket}/*'
+                  - !Ref ArtifactsBucket
+              - Effect: Allow
+                Action:
+                  - 'codebuild:BatchGetBuilds'
+                  - 'codebuild:StartBuild'
+                Resource:
+                  - !GetAtt CodeBuildProject.Arn
+                  - !GetAtt CodeBuildDeploy.Arn
+
+  # CodePipeline
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub 'hive-service-print-pipeline-${Environment}'
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactsBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: '1'
+              Configuration:
+                Owner: !Ref GitHubOwner
+                Repo: !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubToken
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceOutput
+        
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+        
+        - Name: Deploy
+          Actions:
+            - Name: DeployAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildDeploy
+              InputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+
+  # GitHub Webhook (for automatic triggering)
+  GitHubWebhook:
+    Type: AWS::CodePipeline::Webhook
+    Properties:
+      Name: !Sub 'hive-service-print-webhook-${Environment}'
+      Authentication: GITHUB_HMAC
+      AuthenticationConfiguration:
+        SecretToken: !Ref GitHubToken
+      Filters:
+        - JsonPath: $.ref
+          MatchEquals: !Sub 'refs/heads/${GitHubBranch}'
+      TargetPipeline: !Ref CodePipeline
+      TargetAction: SourceAction
+      TargetPipelineVersion: !GetAtt CodePipeline.Version
+      RegisterWithThirdParty: true
+
+  # CloudWatch Log Groups for CodeBuild
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/hive-service-print-build-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  CodeBuildDeployLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/hive-service-print-deploy-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  # CloudWatch Alarms for Pipeline Monitoring
+  PipelineFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'hive-pipeline-failure-${Environment}'
+      AlarmDescription: 'CodePipeline execution failed'
+      MetricName: PipelineExecutionFailure
+      Namespace: AWS/CodePipeline
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: PipelineName
+          Value: !Ref CodePipeline
+      TreatMissingData: notBreaching
+
+Outputs:
+  PipelineName:
+    Description: 'Name of the CodePipeline'
+    Value: !Ref CodePipeline
+    Export:
+      Name: !Sub '${AWS::StackName}-PipelineName'
+
+  ECRRepositoryURI:
+    Description: 'ECR Repository URI'
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ECRRepositoryURI'
+
+  ArtifactsBucketName:
+    Description: 'S3 Bucket for pipeline artifacts'
+    Value: !Ref ArtifactsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ArtifactsBucket'
+
+  CodeBuildProjectName:
+    Description: 'CodeBuild project name for builds'
+    Value: !Ref CodeBuildProject
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeBuildProject'
+
+  WebhookURL:
+    Description: 'GitHub webhook URL'
+    Value: !GetAtt GitHubWebhook.Url
+    Export:
+      Name: !Sub '${AWS::StackName}-WebhookURL'

@@ -1,0 +1,38 @@
+[
+  {
+    "ParameterKey": "Environment",
+    "ParameterValue": "prod"
+  },
+  {
+    "ParameterKey": "ECRImageURI",
+    "ParameterValue": "891377085221.dkr.ecr.eu-west-2.amazonaws.com/hive-service-print:latest"
+  },
+  {
+    "ParameterKey": "ExistingSQSQueueUrl",
+    "ParameterValue": "https://sqs.eu-west-2.amazonaws.com/891377085221/hive-print-order-queue-production"
+  },
+  {
+    "ParameterKey": "ExistingSQSQueueArn",
+    "ParameterValue": "arn:aws:sqs:eu-west-2:891377085221:hive-print-order-queue-production"
+  },
+  {
+    "ParameterKey": "ExistingS3BucketName",
+    "ParameterValue": "hive-designer-production"
+  },
+  {
+    "ParameterKey": "VpcId",
+    "ParameterValue": "vpc-12345678"
+  },
+  {
+    "ParameterKey": "SubnetIds",
+    "ParameterValue": "subnet-12345678,subnet-87654321"
+  },
+  {
+    "ParameterKey": "LambdaTimeout",
+    "ParameterValue": "900"
+  },
+  {
+    "ParameterKey": "LambdaMemorySize",
+    "ParameterValue": "2048"
+  }
+]

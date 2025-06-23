@@ -9,7 +9,7 @@ public class ServiceConfiguration
 
 public class AwsConfiguration
 {
-    public string Region { get; set; } = "us-east-1";
+    public string Region { get; set; } = "eu-west-2";
     public string S3BucketName { get; set; } = string.Empty;
     public string SqsQueueUrl { get; set; } = string.Empty;
 }

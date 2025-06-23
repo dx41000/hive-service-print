@@ -8,16 +8,13 @@ services:
     ports:
       - "9000:8080"
     environment:
-      - AWS_REGION=us-east-1
+      - AWS_REGION=eu-west-2
       - CART_FILES_PATH=/tmp/cart/{printRequestId}/{productVariantId}/{productVariantViewId}
       - FONTS_PATH=/app/Fonts/
-      - S3_BUCKET_NAME=your-bucket-name
-      - SQS_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789012/hive-print-queue
-      - RESULT_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789012/hive-print-results
-      - IRONPDF_LICENSE_KEY=${IRONPDF_LICENSE_KEY}
-      - CHROME_BIN=/usr/bin/google-chrome
-      - CHROME_PATH=/usr/bin/google-chrome
-      - DISPLAY=:99
+      - S3_BUCKET_NAME=hive-designer-development
+      - SQS_QUEUE_URL=https://sqs.eu-west-2.amazonaws.com/891377085221/hive-print-order-queue-development
+      - RESULT_QUEUE_URL=https://sqs.eu-west-2.amazonaws.com/891377085221/hive-print-results-development
+      - DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
     volumes:
       # Mount fonts directory if you have local fonts
       # - ./fonts:/app/Fonts:ro

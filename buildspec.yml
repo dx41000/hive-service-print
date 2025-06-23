@@ -1,0 +1,86 @@
+version: 0.2
+
+env:
+  variables:
+    DOTNET_CLI_TELEMETRY_OPTOUT: 1
+    DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 1
+  
+phases:
+  install:
+    runtime-versions:
+      docker: 20
+    commands:
+      - echo Installing dependencies...
+      - apt-get update -y
+      - apt-get install -y jq
+      - echo .NET SDK version
+      - dotnet --version
+
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR...
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - IMAGE_TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:0:8}
+      - IMAGE_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+      - IMAGE_URI_LATEST=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:latest
+      - echo Image URI is $IMAGE_URI
+      - echo Environment is $ENVIRONMENT
+
+  build:
+    commands:
+      - echo Build started on `date`
+      - echo Building .NET application...
+      - cd hive.service.print
+      - dotnet restore
+      - dotnet build -c Release --no-restore
+      - echo Building Docker image...
+      - docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG .
+      - docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $IMAGE_URI
+      - docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $IMAGE_URI_LATEST
+
+  post_build:
+    commands:
+      - echo Build completed on `date`
+      - echo Running security scan...
+      - |
+        if [ "$ENVIRONMENT" = "prod" ]; then
+          echo "Running production security checks..."
+          # Add any security scanning tools here
+        fi
+      - echo Pushing Docker images...
+      - docker push $IMAGE_URI
+      - docker push $IMAGE_URI_LATEST
+      - echo Writing image definitions file...
+      - printf '[{"name":"hive-service-print","imageUri":"%s"}]' $IMAGE_URI > imagedefinitions.json
+      - echo Updating CloudFormation parameters...
+      - cd ..
+      - |
+        if [ -f "cloudformation-parameters-${ENVIRONMENT}.json" ]; then
+          jq --arg uri "$IMAGE_URI" '(.[] | select(.ParameterKey == "ECRImageURI") | .ParameterValue) = $uri' \
+            cloudformation-parameters-${ENVIRONMENT}.json > cloudformation-parameters-${ENVIRONMENT}.json.tmp && \
+            mv cloudformation-parameters-${ENVIRONMENT}.json.tmp cloudformation-parameters-${ENVIRONMENT}.json
+          echo "Updated parameters file with new image URI"
+        else
+          echo "Warning: Parameters file not found for environment $ENVIRONMENT"
+        fi
+      - echo Generating deployment summary...
+      - |
+        cat > deployment-summary.json << EOF
+        {
+          "environment": "$ENVIRONMENT",
+          "imageUri": "$IMAGE_URI",
+          "buildTime": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+          "commitId": "$CODEBUILD_RESOLVED_SOURCE_VERSION",
+          "buildId": "$CODEBUILD_BUILD_ID"
+        }
+        EOF
+
+artifacts:
+  files:
+    - '**/*'
+  name: hive-service-print-$ENVIRONMENT-$(date +%Y-%m-%d-%H-%M-%S)
+
+cache:
+  paths:
+    - '/root/.nuget/packages/**/*'
+    - 'hive.service.print/obj/**/*'

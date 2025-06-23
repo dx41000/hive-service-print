@@ -1,0 +1,253 @@
+name: Deploy Hive Service Print Lambda
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - staging
+  pull_request:
+    branches:
+      - main
+
+env:
+  AWS_REGION: eu-west-2
+  ECR_REPOSITORY: hive-service-print
+
+jobs:
+  determine-environment:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      should-deploy: ${{ steps.set-env.outputs.should-deploy }}
+    steps:
+      - name: Determine environment
+        id: set-env
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+            echo "should-deploy=true" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/staging" ]]; then
+            echo "environment=staging" >> $GITHUB_OUTPUT
+            echo "should-deploy=true" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/develop" ]]; then
+            echo "environment=dev" >> $GITHUB_OUTPUT
+            echo "should-deploy=true" >> $GITHUB_OUTPUT
+          else
+            echo "environment=dev" >> $GITHUB_OUTPUT
+            echo "should-deploy=false" >> $GITHUB_OUTPUT
+          fi
+
+  build-and-test:
+    runs-on: ubuntu-latest
+    needs: determine-environment
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore dependencies
+        run: |
+          cd hive.service.print
+          dotnet restore
+
+      - name: Build
+        run: |
+          cd hive.service.print
+          dotnet build --no-restore -c Release
+
+      - name: Test
+        run: |
+          cd hive.service.print
+          dotnet test --no-build -c Release --verbosity normal
+
+  build-and-push-image:
+    runs-on: ubuntu-latest
+    needs: [determine-environment, build-and-test]
+    if: needs.determine-environment.outputs.should-deploy == 'true'
+    outputs:
+      image-uri: ${{ steps.build-image.outputs.image-uri }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          ENVIRONMENT: ${{ needs.determine-environment.outputs.environment }}
+        run: |
+          cd hive.service.print
+          
+          # Build Docker image
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:$ENVIRONMENT
+          
+          # Push images
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$ENVIRONMENT
+          
+          # Output image URI
+          echo "image-uri=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [determine-environment, build-and-push-image]
+    if: needs.determine-environment.outputs.should-deploy == 'true'
+    environment: ${{ needs.determine-environment.outputs.environment }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update CloudFormation parameters
+        env:
+          ENVIRONMENT: ${{ needs.determine-environment.outputs.environment }}
+          IMAGE_URI: ${{ needs.build-and-push-image.outputs.image-uri }}
+        run: |
+          # Update parameters file with new image URI
+          jq --arg uri "$IMAGE_URI" '(.[] | select(.ParameterKey == "ECRImageURI") | .ParameterValue) = $uri' \
+            cloudformation-parameters-${ENVIRONMENT}.json > cloudformation-parameters-${ENVIRONMENT}.json.tmp && \
+            mv cloudformation-parameters-${ENVIRONMENT}.json.tmp cloudformation-parameters-${ENVIRONMENT}.json
+
+      - name: Deploy CloudFormation stack
+        env:
+          ENVIRONMENT: ${{ needs.determine-environment.outputs.environment }}
+          STACK_NAME: hive-print-${{ needs.determine-environment.outputs.environment }}
+        run: |
+          # Validate template
+          aws cloudformation validate-template \
+            --template-body file://cloudformation-lambda.yaml \
+            --region $AWS_REGION
+
+          # Deploy stack
+          if aws cloudformation describe-stacks --stack-name $STACK_NAME --region $AWS_REGION >/dev/null 2>&1; then
+            echo "Updating existing stack..."
+            aws cloudformation update-stack \
+              --stack-name $STACK_NAME \
+              --template-body file://cloudformation-lambda.yaml \
+              --parameters file://cloudformation-parameters-${ENVIRONMENT}.json \
+              --capabilities CAPABILITY_NAMED_IAM \
+              --region $AWS_REGION
+            
+            aws cloudformation wait stack-update-complete \
+              --stack-name $STACK_NAME \
+              --region $AWS_REGION
+          else
+            echo "Creating new stack..."
+            aws cloudformation create-stack \
+              --stack-name $STACK_NAME \
+              --template-body file://cloudformation-lambda.yaml \
+              --parameters file://cloudformation-parameters-${ENVIRONMENT}.json \
+              --capabilities CAPABILITY_NAMED_IAM \
+              --region $AWS_REGION
+            
+            aws cloudformation wait stack-create-complete \
+              --stack-name $STACK_NAME \
+              --region $AWS_REGION
+          fi
+
+      - name: Get stack outputs
+        env:
+          ENVIRONMENT: ${{ needs.determine-environment.outputs.environment }}
+          STACK_NAME: hive-print-${{ needs.determine-environment.outputs.environment }}
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: $ENVIRONMENT" >> $GITHUB_STEP_SUMMARY
+          echo "- **Stack Name**: $STACK_NAME" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image URI**: ${{ needs.build-and-push-image.outputs.image-uri }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Stack Outputs" >> $GITHUB_STEP_SUMMARY
+          aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --region $AWS_REGION \
+            --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' \
+            --output table >> $GITHUB_STEP_SUMMARY
+
+  integration-test:
+    runs-on: ubuntu-latest
+    needs: [determine-environment, deploy]
+    if: needs.determine-environment.outputs.should-deploy == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run integration tests
+        env:
+          ENVIRONMENT: ${{ needs.determine-environment.outputs.environment }}
+          STACK_NAME: hive-print-${{ needs.determine-environment.outputs.environment }}
+        run: |
+          # Get SQS queue URL from stack outputs
+          QUEUE_URL=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --region $AWS_REGION \
+            --query 'Stacks[0].Outputs[?OutputKey==`ExistingSQSQueueURL`].OutputValue' \
+            --output text)
+          
+          if [ -z "$QUEUE_URL" ]; then
+            echo "Using existing queue URL for $ENVIRONMENT"
+            QUEUE_URL="https://sqs.eu-west-2.amazonaws.com/891377085221/hive-print-order-queue-${ENVIRONMENT}"
+          fi
+          
+          echo "Testing with queue: $QUEUE_URL"
+          
+          # Send test message
+          MESSAGE_ID="github-test-$(date +%s)"
+          aws sqs send-message \
+            --queue-url "$QUEUE_URL" \
+            --message-body "{
+              \"MessageId\": \"$MESSAGE_ID\",
+              \"MessageType\": \"GenerateImage\",
+              \"Payload\": {
+                \"ProductVariantId\": 123,
+                \"GenerateImages\": []
+              },
+              \"Timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",
+              \"CorrelationId\": \"github-actions-test\"
+            }" \
+            --region $AWS_REGION
+          
+          echo "Test message sent with ID: $MESSAGE_ID"
+          
+          # Wait a bit and check Lambda logs
+          sleep 30
+          
+          # Check recent Lambda logs for our test message
+          aws logs filter-log-events \
+            --log-group-name "/aws/lambda/hive-print-service-${ENVIRONMENT}" \
+            --start-time $(date -d '5 minutes ago' +%s)000 \
+            --filter-pattern "$MESSAGE_ID" \
+            --region $AWS_REGION \
+            --query 'events[*].message' \
+            --output text || echo "No logs found (this might be expected for the first deployment)"
