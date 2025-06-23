@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  hive-service-print:
+    build:
+      context: ./hive.service.print
+      dockerfile: Dockerfile
+    ports:
+      - "9000:8080"
+    environment:
+      - AWS_REGION=us-east-1
+      - CART_FILES_PATH=/tmp/cart/{printRequestId}/{productVariantId}/{productVariantViewId}
+      - FONTS_PATH=/app/Fonts/
+      - S3_BUCKET_NAME=your-bucket-name
+      - SQS_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789012/hive-print-queue
+      - RESULT_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789012/hive-print-results
+      - IRONPDF_LICENSE_KEY=${IRONPDF_LICENSE_KEY}
+      - CHROME_BIN=/usr/bin/google-chrome
+      - CHROME_PATH=/usr/bin/google-chrome
+      - DISPLAY=:99
+    volumes:
+      # Mount fonts directory if you have local fonts
+      # - ./fonts:/app/Fonts:ro
+      # Mount logs directory for debugging
+      - ./logs:/tmp/logs
+    networks:
+      - hive-network
+    restart: unless-stopped
+    # Resource limits for PDF generation
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+        reservations:
+          memory: 1G
+          cpus: '1.0'
+
+  # Optional: LocalStack for local AWS services testing
+  localstack:
+    image: localstack/localstack:latest
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=sqs,s3
+      - DEBUG=1
+      - DATA_DIR=/tmp/localstack/data
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "./localstack-data:/tmp/localstack"
+    networks:
+      - hive-network
+
+networks:
+  hive-network:
+    driver: bridge
+
+volumes:
+  localstack-data:
+    driver: local
